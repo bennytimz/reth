@@ -8,8 +8,7 @@ use reth_cli::chainspec::ChainSpecParser;
 use reth_fs_util as fs;
 use std::{
     borrow::Cow,
-    fs::{File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -323,13 +322,29 @@ fn extract_archive<R: Read>(
 
 /// Extracts a snapshot from a local file.
 fn extract_from_file(path: &Path, format: CompressionFormat, target_dir: &Path) -> Result<()> {
-    let file = std::fs::File::open(path)?;
+    let file = fs::open(path)?;
     let total_size = file.metadata()?.len();
     extract_archive(file, total_size, format, target_dir)
 }
 
 const MAX_DOWNLOAD_RETRIES: u32 = 10;
 const RETRY_BACKOFF_SECS: u64 = 5;
+
+/// Adapter to track download progress while reading, for use with `io::copy`.
+struct DownloadProgressReader<R> {
+    reader: R,
+    progress: DownloadProgress,
+}
+
+impl<R: Read> Read for DownloadProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.reader.read(buf)?;
+        if n > 0 {
+            let _ = self.progress.update(n as u64);
+        }
+        Ok(n)
+    }
+}
 
 /// Downloads a file with resume support using HTTP Range requests.
 /// Automatically retries on failure, resuming from where it left off.
@@ -354,7 +369,7 @@ fn resumable_download(url: &str, target_dir: &Path) -> Result<(PathBuf, u64)> {
         if let Some(total) = total_size &&
             existing_size >= total
         {
-            std::fs::rename(&part_path, &final_path)?;
+            fs::rename(&part_path, &final_path)?;
             info!(target: "reth::cli", "Download complete: {}", final_path.display());
             return Ok((final_path, total));
         }
@@ -369,9 +384,6 @@ fn resumable_download(url: &str, target_dir: &Path) -> Result<(PathBuf, u64)> {
         let mut request = client.get(url);
         if existing_size > 0 {
             request = request.header(RANGE, format!("bytes={existing_size}-"));
-            if attempt == 1 {
-                info!(target: "reth::cli", "Resuming download from {} bytes", existing_size);
-            }
         }
 
         let response = match request.send().and_then(|r| r.error_for_status()) {
@@ -409,54 +421,43 @@ fn resumable_download(url: &str, target_dir: &Path) -> Result<(PathBuf, u64)> {
             eyre::eyre!("Server did not provide Content-Length or Content-Range header")
         })?;
 
-        let mut file = if is_partial && existing_size > 0 {
-            OpenOptions::new().append(true).open(&part_path)?
+        let file = if is_partial && existing_size > 0 {
+            info!(target: "reth::cli", "Resuming download from {} bytes", existing_size);
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&part_path)
+                .map_err(|e| eyre::eyre!("failed to open {}: {e}", part_path.display()))?
         } else {
-            File::create(&part_path)?
+            fs::create_file(&part_path)?
         };
 
         let start_offset = if is_partial { existing_size } else { 0 };
         let mut progress = DownloadProgress::new(current_total);
         progress.downloaded = start_offset;
 
-        let mut buf = [0u8; 64 * 1024];
-        let mut reader = response;
-        let mut download_error: Option<eyre::Error> = None;
+        let mut reader = DownloadProgressReader { reader: response, progress };
+        let mut writer = BufWriter::with_capacity(64 * 1024, file);
 
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = file.write_all(&buf[..n]) {
-                        download_error = Some(e.into());
-                        break;
-                    }
-                    let _ = progress.update(n as u64);
-                }
-                Err(e) => {
-                    download_error = Some(e.into());
-                    break;
-                }
-            }
-        }
-
-        let _ = file.flush();
+        let copy_result = io::copy(&mut reader, &mut writer);
+        let flush_result = writer.flush();
         println!();
 
-        if let Some(e) = download_error {
-            last_error = Some(e);
-            if attempt < MAX_DOWNLOAD_RETRIES {
-                info!(target: "reth::cli",
-                    "Download interrupted, retrying in {} seconds...", RETRY_BACKOFF_SECS
-                );
-                std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS));
+        match copy_result.and(flush_result) {
+            Ok(_) => {
+                fs::rename(&part_path, &final_path)?;
+                info!(target: "reth::cli", "Download complete: {}", final_path.display());
+                return Ok((final_path, current_total));
             }
-            continue;
+            Err(e) => {
+                last_error = Some(e.into());
+                if attempt < MAX_DOWNLOAD_RETRIES {
+                    info!(target: "reth::cli",
+                        "Download interrupted, retrying in {} seconds...", RETRY_BACKOFF_SECS
+                    );
+                    std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS));
+                }
+            }
         }
-
-        std::fs::rename(&part_path, &final_path)?;
-        info!(target: "reth::cli", "Download complete: {}", final_path.display());
-        return Ok((final_path, current_total));
     }
 
     Err(last_error
@@ -468,10 +469,10 @@ fn download_and_extract(url: &str, format: CompressionFormat, target_dir: &Path)
     let (downloaded_path, total_size) = resumable_download(url, target_dir)?;
 
     info!(target: "reth::cli", "Extracting snapshot...");
-    let file = File::open(&downloaded_path)?;
+    let file = fs::open(&downloaded_path)?;
     extract_archive(file, total_size, format, target_dir)?;
 
-    std::fs::remove_file(&downloaded_path)?;
+    fs::remove_file(&downloaded_path)?;
     info!(target: "reth::cli", "Removed downloaded archive");
 
     Ok(())
