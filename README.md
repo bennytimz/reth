@@ -1,4 +1,13 @@
 # reth
+## Quick Start (for first-time users)
+
+If you just want to run reth locally with default settings:
+
+```bash
+git clone https://github.com/tempoxyz/reth.git
+cd reth
+cargo build --release
+./target/release/reth node
 
 [![bench status](https://github.com/paradigmxyz/reth/actions/workflows/bench.yml/badge.svg)](https://github.com/paradigmxyz/reth/actions/workflows/bench.yml)
 [![CI status](https://github.com/paradigmxyz/reth/workflows/unit/badge.svg)][gh-ci]
